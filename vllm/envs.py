@@ -232,6 +232,8 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = False
+    VLLM_ALLREDUCE_USE_PCIE_ONESHOT: bool = False
+    VLLM_PCIE_ONESHOT_MAX_SIZE: str = "auto"
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
@@ -1765,6 +1767,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use FlashInfer allreduce
     "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0"))
+    ),
+    "VLLM_ALLREDUCE_USE_PCIE_ONESHOT": lambda: bool(
+        int(os.getenv("VLLM_ALLREDUCE_USE_PCIE_ONESHOT", "0"))
+    ),
+    "VLLM_PCIE_ONESHOT_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_MAX_SIZE", "auto"
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

@@ -47,16 +47,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_custom_allreduce = False
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
+            use_pcie_oneshot = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
             use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
+            use_pcie_oneshot = envs.VLLM_ALLREDUCE_USE_PCIE_ONESHOT
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
+        self.use_pcie_oneshot = use_pcie_oneshot
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -64,6 +67,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         from vllm.distributed.device_communicators.flashinfer_all_reduce import (
             FlashInferAllReduce,
+        )
+        from vllm.distributed.device_communicators.pcie_oneshot_communicator import (
+            PCIeOneshotCommunicator,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
@@ -84,6 +90,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
+        self.pcie_oneshot_comm: PCIeOneshotCommunicator | None = None
+
+        if self.use_pcie_oneshot and self.world_size > 1:
+            assert self.device_group is not None
+            self.pcie_oneshot_comm = PCIeOneshotCommunicator(
+                group=self.device_group, device=self.device
+            )
+            if self.pcie_oneshot_comm.disabled:
+                self.pcie_oneshot_comm = None
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -191,6 +206,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "PCIE_ONESHOT",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
             "FLASHINFER",
@@ -199,6 +215,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.pcie_oneshot_comm is not None and not self.pcie_oneshot_comm.disabled:
+            enabled_ar_backends.append("PCIE_ONESHOT")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
         # VLLM_BATCH_INVARIANT off, NCCL symm mem enabled, world_size meets
         # min_world_size, and world_size either has a tuned entry in
@@ -244,6 +262,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # PCIe oneshot wins for small messages (<128KB); self-gates by size
+        pcie_comm = self.pcie_oneshot_comm
+        if (
+            pcie_comm is not None
+            and not pcie_comm.disabled
+            and pcie_comm.should_pcie_ar(input_)
+        ):
+            out = pcie_comm.all_reduce(input_)
+            if out is not None:
+                return out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -406,6 +434,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
+        if self.pcie_oneshot_comm is not None:
+            self.pcie_oneshot_comm.close()
+            self.pcie_oneshot_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.fi_ar_comm is not None:
