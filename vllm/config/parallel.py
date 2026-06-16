@@ -772,6 +772,20 @@ class ParallelConfig:
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        # When expert parallelism is requested with TP=1, automatically
+        # set tensor_parallel_size to the number of available GPUs so
+        # the EP group spans all devices (EP replaces TP for MoE layers).
+        if self.enable_expert_parallel and self.tensor_parallel_size == 1:
+            import torch
+            gpu_count = torch.cuda.device_count()
+            if gpu_count > 1:
+                logger.info(
+                    "Auto-setting tensor_parallel_size=%d for expert parallelism "
+                    "(EP replaces TP for MoE layers).",
+                    gpu_count,
+                )
+                self.tensor_parallel_size = gpu_count
+
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size
