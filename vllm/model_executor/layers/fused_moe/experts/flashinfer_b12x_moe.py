@@ -227,10 +227,40 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
         top_k = topk_ids.shape[1]
 
+        num_experts = global_num_experts
+        _topk_weights = topk_weights
+        _topk_ids = topk_ids
+
+        # Expert Parallelism: the b12x kernel expects num_local_experts ==
+        # num_experts, so when EP partitions experts across ranks we must
+        # convert router-assigned global IDs (0..global_num_experts-1) to
+        # local indices (0..num_local-1) and zero out contributions from
+        # non-local experts.
+        #
+        # We gate on expert_map rather than num_local_experts !=
+        # global_num_experts because some prepare_finalize paths (e.g.
+        # all2all-based dispatch) may pre-remap topk_ids and set
+        # expert_map=None even when EP is active.
+        if expert_map is not None:
+            assert expert_map.device == _topk_ids.device, (
+                f"expert_map device {expert_map.device} does not match "
+                f"topk_ids device {_topk_ids.device}"
+            )
+            # expert_map[global_id] = local_id or -1 for non-local experts.
+            _topk_ids = expert_map[_topk_ids.long()]
+            non_local_mask = _topk_ids == -1
+            # TODO(perf): clamping non-local rows to expert 0 concentrates
+            # ~75% of routed rows onto one expert (wasted FLOPs with weight=0).
+            # A cleaner approach would filter non-local rows at the kernel level.
+            _topk_ids = _topk_ids.clamp(min=0)
+            _topk_weights = _topk_weights.clone()
+            _topk_weights[non_local_mask] = 0.0
+            num_experts = self.num_local_experts
+
         flashinfer_b12x_fused_moe(
             x=hidden_states,
-            token_selected_experts=topk_ids.to(torch.int32),
-            token_final_scales=topk_weights,
+            token_selected_experts=_topk_ids.to(torch.int32),
+            token_final_scales=_topk_weights,
             w1_weight=w1,
             w1_weight_sf=self.w1_sf_mma,
             w1_alpha=self.g1_alphas,
@@ -238,7 +268,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             w2_weight=w2,
             w2_weight_sf=self.w2_sf_mma,
             w2_alpha=self.g2_alphas,
-            num_experts=global_num_experts,
+            num_experts=num_experts,
             top_k=top_k,
             num_local_experts=self.num_local_experts,
             output_dtype=self.out_dtype,

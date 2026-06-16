@@ -1078,16 +1078,29 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        # We can reuse the memory between cache1 and cache3 because by the
-        # time we need cache3, we're done with cache1.
-        # Reuse workspace13 for the output since there is only one chunk.
-        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
-            (workspace2_shape, workspace_dtype),
-        )
-        workspace13 = _resize_cache(common_workspace, workspace13_shape)
-        fused_out = _resize_cache(common_workspace, fused_out_shape)
+        # When workspace13 is smaller than fused_out (e.g. b12x backends
+        # that manage their own internal workspace), allocate fused_out
+        # separately.  Sharing the buffer causes cudaErrorIllegalAddress
+        # in EP mode because the b12x kernel writes asynchronously while
+        # the next layer may read the same buffer.
+        if prod(workspace13_shape) < prod(fused_out_shape):
+            workspace13, workspace2 = current_workspace_manager().get_simultaneous(
+                (workspace13_shape, workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
+            fused_out = torch.empty(
+                fused_out_shape, dtype=workspace_dtype, device=device
+            )
+        else:
+            # We can reuse the memory between cache1 and cache3 because by the
+            # time we need cache3, we're done with cache1.
+            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+            common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+                ((max_shape_size,), workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
+            workspace13 = _resize_cache(common_workspace, workspace13_shape)
+            fused_out = _resize_cache(common_workspace, fused_out_shape)
 
         return workspace13, workspace2, fused_out
 
