@@ -727,7 +727,9 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    gdn_prefill_backend: (
+        Literal["flashinfer", "triton", "cutedsl", "flashqla"] | None
+    ) = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1585,7 +1587,7 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl"],
+            choices=["flashinfer", "triton", "cutedsl", "flashqla"],
             default=None,
             help="Select GDN prefill backend.",
         )

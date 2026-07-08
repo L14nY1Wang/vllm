@@ -147,9 +147,25 @@ def _is_libs_cu13_install_intact() -> bool:
     return True
 
 
+@functools.cache
+def _is_flashqla_available() -> bool:
+    """Return True if the ``flash_qla`` package is importable.
+
+    FlashQLA is an optional external dependency (Qwen team's tilelang-based
+    gated delta rule kernels). It is imported lazily — never at module
+    load — so vLLM keeps running without it installed; the flashqla backend
+    is only selected when this returns True on supported hardware.
+    """
+    try:
+        import flash_qla  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "flashqla"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -164,6 +180,12 @@ def _resolve_gdn_prefill_backend(
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
     * Blackwell (SM10.x) with ``head_k_dim == 128``;
+
+    FlashQLA's GDN prefill kernel is chosen when:
+    * "flashqla" is requested; (opt-in only)
+    * ``platform == cuda`` and (Hopper (SM90), Blackwell (SM10.x), or
+      Blackwell SM12.x) — the architectures FlashQLA's tilelang kernels
+      target — and the ``flash_qla`` package is importable.
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
@@ -182,9 +204,11 @@ def _resolve_gdn_prefill_backend(
 
     supports_flashinfer = False
     supports_cutedsl = False
+    supports_flashqla = False
 
     if current_platform.is_device_capability(90):
         supports_flashinfer = True
+        supports_flashqla = True
     elif (
         current_platform.is_device_capability_family(100)
         and head_k_dim == 128
@@ -192,6 +216,7 @@ def _resolve_gdn_prefill_backend(
     ):
         supports_flashinfer = _is_libs_cu13_install_intact()
         supports_cutedsl = True
+        supports_flashqla = True
         if not supports_flashinfer:
             logger.warning_once(
                 "FlashInfer Blackwell GDN requires an intact nvidia-cutlass-dsl"
@@ -203,11 +228,24 @@ def _resolve_gdn_prefill_backend(
                 "to Triton/FLA. Repair with: pip install --force-reinstall "
                 "--no-deps nvidia-cutlass-dsl-libs-cu13"
             )
+    elif current_platform.is_device_capability_family(120):
+        # Blackwell SM12.x: FlashQLA has a dedicated blackwell_sm120 path.
+        # FlashInfer/CuteDSL GDN kernels are not supported here.
+        supports_flashqla = True
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"
     if backend == "cutedsl" and supports_cutedsl:
         return backend, "cutedsl"
+    if backend == "flashqla" and supports_flashqla:
+        if not _is_flashqla_available():
+            logger.warning_once(
+                "flashqla GDN prefill backend requested but the `flash_qla` "
+                "package is not installed. Falling back to Triton/FLA. "
+                "Install with: pip install flash_qla"
+            )
+        else:
+            return backend, "flashqla"
     return backend, "triton"
 
 
@@ -223,6 +261,7 @@ def _log_gdn_backend_decision(
     chosen = {
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
+        "flashqla": "FlashQLA",
         "triton": "Triton/FLA",
     }[active_backend]
     logger.info_once(
@@ -234,6 +273,11 @@ def _log_gdn_backend_decision(
     if active_backend == "flashinfer" and current_platform.is_device_capability(90):
         logger.warning_once(
             "FlashInfer GDN prefill is JIT-compiled; first run may take a "
+            "while. Set --gdn-prefill-backend triton to skip JIT.",
+        )
+    if active_backend == "flashqla":
+        logger.warning_once(
+            "FlashQLA GDN prefill is JIT-compiled; first run may take a "
             "while. Set --gdn-prefill-backend triton to skip JIT.",
         )
 
@@ -295,7 +339,10 @@ class ChunkGatedDeltaRule(CustomOp):
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+        if (
+            backend in ("flashinfer", "cutedsl", "flashqla")
+            and active_backend != backend
+        ):
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
@@ -307,6 +354,8 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif active_backend == "flashqla":
+            self._forward_method = self.forward_flashqla
         else:
             self._forward_method = self.forward_native
 
@@ -413,6 +462,62 @@ class ChunkGatedDeltaRule(CustomOp):
         )
         if not output_final_state:
             final_state = None
+        return o, final_state
+
+    def forward_flashqla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        from flash_qla import chunk_gated_delta_rule as chunk_gated_delta_rule_qla
+
+        # chunk_indices/chunk_offsets are unused: FlashQLA computes its own
+        # internal chunking (chunk_local_cumsum + kkt_solve + prepare_chunk_offsets).
+        if use_qk_l2norm_in_kernel:
+            q = l2norm_fwd(q)
+            k = l2norm_fwd(k)
+
+        # FlashQLA's reference/tests construct g, beta and the recurrent state
+        # in fp32 even when q/k/v are bf16; mirror the flashinfer path and cast
+        # to fp32 to avoid precision loss in the internal cumsum/kkt-solve.
+        qla_g = g.to(torch.float32)
+        qla_beta = beta.to(torch.float32)
+        qla_state = (
+            initial_state.to(torch.float32) if initial_state is not None else None
+        )
+
+        # state_v_first=True: vLLM's ssm_state is [N, Hv, V, K], and FlashQLA's
+        # state_v_first=True expects exactly (B, H, DV, DK) == [B, Hv, V, K].
+        o, final_state = chunk_gated_delta_rule_qla(
+            q=q,
+            k=k,
+            v=v,
+            g=qla_g,
+            beta=qla_beta,
+            initial_state=qla_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens,
+            head_first=False,
+            state_v_first=True,
+            auto_cp=True,
+        )
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        if final_state is not None:
+            final_state = final_state.to(initial_state.dtype)
         return o, final_state
 
 
